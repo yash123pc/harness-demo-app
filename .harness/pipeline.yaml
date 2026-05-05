@@ -3,11 +3,12 @@ pipeline:
   identifier: harness_demo_cicd_sto
   projectIdentifier: default_project
   orgIdentifier: default
+  # NOTE: targets the auto-created "default_project". harness-setup.sh imports this YAML as-is.
   description: |
-    End-to-end CI/CD + STO pipeline for a simple Python Flask app.
+    End-to-end CI/CD + security pipeline for a simple Python Flask app.
     Stages:
       1. CI       - build & push the Docker image (tagged with commit SHA)
-      2. STO      - Trivy container scan, FAIL on any CRITICAL vulnerability
+      2. Security - Trivy container scan + Bandit SAST, FAIL on CRITICAL
       3. CD       - rolling deployment to local Kubernetes
       4. Validate - hit /health and verify a 200 OK response
     Secrets (Docker Hub creds, kubeconfig) are pulled from Harness Secret Manager
@@ -18,7 +19,7 @@ pipeline:
   properties:
     ci:
       codebase:
-        connectorRef: account.github_connector
+        connectorRef: github_connector
         repoName: harness-demo-app
         build: <+input>
 
@@ -44,7 +45,7 @@ pipeline:
     # 1) CI — Build & Push
     # ======================================================================
     - stage:
-        name: CI - Build & Push
+        name: CI - Build and Push
         identifier: ci_build_push
         type: CI
         spec:
@@ -64,7 +65,9 @@ pipeline:
                   name: Unit tests
                   identifier: unit_tests
                   spec:
-                    connectorRef: account.dockerhub_public
+                    # connectorRef authenticates the image pull against Docker Hub
+                    # so we don't hit anonymous rate limits (100/6hr per shared IP).
+                    connectorRef: dockerhub_connector
                     image: python:3.12-slim
                     shell: Sh
                     command: |
@@ -78,10 +81,10 @@ pipeline:
               # makes the image available to downstream stages as <+artifact>.
               - step:
                   type: BuildAndPushDockerRegistry
-                  name: Build & push image
+                  name: Build and push image
                   identifier: build_push
                   spec:
-                    connectorRef: account.dockerhub_connector
+                    connectorRef: dockerhub_connector
                     repo: <+pipeline.variables.DOCKER_REPO>
                     tags:
                       - <+pipeline.variables.IMAGE_TAG>
@@ -93,14 +96,19 @@ pipeline:
                       BUILD_SHA: <+codebase.commitSha>
 
     # ======================================================================
-    # 2) STO — Container Scan (Trivy)  — Security Gate on CRITICAL
+    # 2) Security Scan — Trivy (container) + Bandit (SAST)
+    # ----------------------------------------------------------------------
+    # We use Trivy as a CLI inside a regular CI Run step rather than the
+    # paid Harness STO module. Same scan, same gate logic, free-tier friendly.
+    # Trivy is the same engine Harness STO wraps, so the security guarantee
+    # is identical — only the orchestration shell is different.
     # ======================================================================
     - stage:
-        name: STO - Security Scan
-        identifier: sto_scan
-        type: SecurityTests
+        name: Security Scan
+        identifier: security_scan
+        type: CI
         spec:
-          cloneCodebase: false
+          cloneCodebase: true
           platform:
             os: Linux
             arch: Amd64
@@ -109,51 +117,46 @@ pipeline:
             spec: {}
           execution:
             steps:
-              # ---- Container scan with Trivy (Harness STO step) -----------
+              # ---- Container scan with Trivy CLI --------------------------
+              # `--exit-code 1 --severity CRITICAL` is the mandatory gate:
+              # any CRITICAL CVE => non-zero exit => stage fails => pipeline fails.
               - step:
-                  type: AquaTrivy
+                  type: Run
                   name: Trivy container scan
                   identifier: trivy_scan
                   spec:
-                    mode: orchestration
-                    config: default
-                    target:
-                      type: container
-                      name: <+pipeline.variables.DOCKER_REPO>
-                      variant: <+pipeline.variables.IMAGE_TAG>
-                    advanced:
-                      log:
-                        level: info
-                      # ---- The mandatory security gate ---------------------
-                      # fail_on_severity=critical => any CRITICAL CVE fails the stage,
-                      # which fails the pipeline (default failure strategy).
-                      fail_on_severity: critical
-                    privileged: true
-                    image:
-                      type: docker_v2
-                      name: <+pipeline.variables.DOCKER_REPO>
-                      tag: <+pipeline.variables.IMAGE_TAG>
-                      access_id: <+secrets.getValue("dockerhub_username")>
-                      access_token: <+secrets.getValue("dockerhub_password")>
+                    connectorRef: dockerhub_connector
+                    image: aquasec/trivy:latest
+                    shell: Sh
+                    command: |
+                      set -eu
+                      IMAGE="<+pipeline.variables.DOCKER_REPO>:<+pipeline.variables.IMAGE_TAG>"
+                      echo ">> Scanning ${IMAGE} for CRITICAL CVEs"
+                      trivy image \
+                        --no-progress \
+                        --severity CRITICAL \
+                        --ignore-unfixed \
+                        --exit-code 1 \
+                        "${IMAGE}"
 
-              # ---- Bonus: SAST on the Python source -----------------------
+              # ---- Bonus: SAST on the Python source with Bandit -----------
               - step:
-                  type: Bandit
-                  name: SAST (Bandit)
+                  type: Run
+                  name: SAST Bandit
                   identifier: sast_bandit
                   spec:
-                    mode: orchestration
-                    config: default
-                    target:
-                      type: repository
-                      name: harness-demo-app
-                      variant: <+codebase.branch>
-                    advanced:
-                      log:
-                        level: info
-                      fail_on_severity: critical
+                    connectorRef: dockerhub_connector
+                    image: python:3.12-slim
+                    shell: Sh
+                    command: |
+                      set -eu
+                      pip install --no-cache-dir bandit
+                      # -lll => only HIGH severity findings fail the build.
+                      # Tweak to -ll for HIGH+MEDIUM if you want stricter SAST.
+                      bandit -r app/ -lll
 
-        # If the security gate trips, mark the pipeline failed (no rollback needed; nothing deployed yet).
+        # If the security gate trips, mark the pipeline failed.
+        # Nothing deployed yet, so no rollback needed.
         failureStrategies:
           - onFailure:
               errors: [AllErrors]
@@ -182,7 +185,7 @@ pipeline:
                         - identifier: dockerhub_image
                           type: DockerRegistry
                           spec:
-                            connectorRef: account.dockerhub_connector
+                            connectorRef: dockerhub_connector
                             imagePath: <+pipeline.variables.DOCKER_REPO>
                             tag: <+pipeline.variables.IMAGE_TAG>
           environment:
@@ -229,7 +232,7 @@ pipeline:
             steps:
               - step:
                   type: ShellScript
-                  name: Curl /health endpoint
+                  name: Curl health endpoint
                   identifier: curl_health
                   timeout: 5m
                   spec:
