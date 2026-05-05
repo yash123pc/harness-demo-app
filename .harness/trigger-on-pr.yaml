@@ -1,0 +1,41 @@
+# Bonus: Shift-left security trigger.
+# Runs the pipeline on every Pull Request opened/synchronized against `main`,
+# so STO scans block the merge before the code lands.
+trigger:
+  name: PR to main
+  identifier: pr_to_main
+  enabled: true
+  description: Run CI + STO on every PR targeting main (shift-left security)
+  tags: {}
+  orgIdentifier: default
+  projectIdentifier: default_project
+  pipelineIdentifier: harness_demo_cicd_sto
+  source:
+    type: Webhook
+    spec:
+      type: Github
+      spec:
+        type: PullRequest
+        spec:
+          connectorRef: account.github_connector
+          autoAbortPreviousExecutions: true
+          payloadConditions:
+            - key: targetBranch
+              operator: Equals
+              value: main
+          headerConditions: []
+          repoName: harness-demo-app
+          actions:
+            - Open
+            - Reopen
+            - Synchronize
+  inputYaml: |
+    pipeline:
+      identifier: harness_demo_cicd_sto
+      properties:
+        ci:
+          codebase:
+            build:
+              type: PR
+              spec:
+                number: <+trigger.prNumber>

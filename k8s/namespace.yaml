@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: harness-demo
+  labels:
+    app: harness-demo-app
+    managed-by: harness

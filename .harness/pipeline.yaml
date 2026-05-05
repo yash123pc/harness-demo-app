@@ -1,0 +1,295 @@
+pipeline:
+  name: harness-demo-cicd-sto
+  identifier: harness_demo_cicd_sto
+  projectIdentifier: default_project
+  orgIdentifier: default
+  description: |
+    End-to-end CI/CD + STO pipeline for a simple Python Flask app.
+    Stages:
+      1. CI       - build & push the Docker image (tagged with commit SHA)
+      2. STO      - Trivy container scan, FAIL on any CRITICAL vulnerability
+      3. CD       - rolling deployment to local Kubernetes
+      4. Validate - hit /health and verify a 200 OK response
+    Secrets (Docker Hub creds, kubeconfig) are pulled from Harness Secret Manager
+    — nothing is hardcoded.
+  tags: {}
+
+  # ---- Pipeline-level inputs (parameterised, override per run) ------------
+  properties:
+    ci:
+      codebase:
+        connectorRef: account.github_connector
+        repoName: harness-demo-app
+        build: <+input>
+
+  variables:
+    - name: DOCKER_REGISTRY
+      type: String
+      description: Docker Hub registry host
+      value: docker.io
+    - name: DOCKER_REPO
+      type: String
+      description: "<your-dockerhub-user>/harness-demo-app"
+      value: <+input>.default(ykbundela/harness-demo-app)
+    - name: IMAGE_TAG
+      type: String
+      description: Image tag — defaults to the short commit SHA
+      value: <+codebase.shortCommitSha>
+    - name: K8S_NAMESPACE
+      type: String
+      value: harness-demo
+
+  stages:
+    # ======================================================================
+    # 1) CI — Build & Push
+    # ======================================================================
+    - stage:
+        name: CI - Build & Push
+        identifier: ci_build_push
+        type: CI
+        spec:
+          cloneCodebase: true
+          # Use a Harness-hosted Linux runner (free tier includes build minutes)
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              # ---- Run unit tests first (fast feedback) -------------------
+              - step:
+                  type: Run
+                  name: Unit tests
+                  identifier: unit_tests
+                  spec:
+                    connectorRef: account.dockerhub_public
+                    image: python:3.12-slim
+                    shell: Sh
+                    command: |
+                      set -eu
+                      cd app
+                      pip install --no-cache-dir -r requirements.txt pytest
+                      python -m pytest -q
+
+              # ---- Build & push to Docker Hub -----------------------------
+              # Harness BuildAndPushDockerRegistry step handles tag/push and
+              # makes the image available to downstream stages as <+artifact>.
+              - step:
+                  type: BuildAndPushDockerRegistry
+                  name: Build & push image
+                  identifier: build_push
+                  spec:
+                    connectorRef: account.dockerhub_connector
+                    repo: <+pipeline.variables.DOCKER_REPO>
+                    tags:
+                      - <+pipeline.variables.IMAGE_TAG>
+                      - latest
+                    dockerfile: Dockerfile
+                    context: .
+                    buildArgs:
+                      APP_VERSION: <+pipeline.variables.IMAGE_TAG>
+                      BUILD_SHA: <+codebase.commitSha>
+
+    # ======================================================================
+    # 2) STO — Container Scan (Trivy)  — Security Gate on CRITICAL
+    # ======================================================================
+    - stage:
+        name: STO - Security Scan
+        identifier: sto_scan
+        type: SecurityTests
+        spec:
+          cloneCodebase: false
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              # ---- Container scan with Trivy (Harness STO step) -----------
+              - step:
+                  type: AquaTrivy
+                  name: Trivy container scan
+                  identifier: trivy_scan
+                  spec:
+                    mode: orchestration
+                    config: default
+                    target:
+                      type: container
+                      name: <+pipeline.variables.DOCKER_REPO>
+                      variant: <+pipeline.variables.IMAGE_TAG>
+                    advanced:
+                      log:
+                        level: info
+                      # ---- The mandatory security gate ---------------------
+                      # fail_on_severity=critical => any CRITICAL CVE fails the stage,
+                      # which fails the pipeline (default failure strategy).
+                      fail_on_severity: critical
+                    privileged: true
+                    image:
+                      type: docker_v2
+                      name: <+pipeline.variables.DOCKER_REPO>
+                      tag: <+pipeline.variables.IMAGE_TAG>
+                      access_id: <+secrets.getValue("dockerhub_username")>
+                      access_token: <+secrets.getValue("dockerhub_password")>
+
+              # ---- Bonus: SAST on the Python source -----------------------
+              - step:
+                  type: Bandit
+                  name: SAST (Bandit)
+                  identifier: sast_bandit
+                  spec:
+                    mode: orchestration
+                    config: default
+                    target:
+                      type: repository
+                      name: harness-demo-app
+                      variant: <+codebase.branch>
+                    advanced:
+                      log:
+                        level: info
+                      fail_on_severity: critical
+
+        # If the security gate trips, mark the pipeline failed (no rollback needed; nothing deployed yet).
+        failureStrategies:
+          - onFailure:
+              errors: [AllErrors]
+              action:
+                type: MarkAsFailure
+
+    # ======================================================================
+    # 3) CD — Deploy to Kubernetes (rolling)
+    # ======================================================================
+    - stage:
+        name: CD - Deploy to K8s
+        identifier: cd_deploy
+        type: Deployment
+        spec:
+          deploymentType: Kubernetes
+          service:
+            serviceRef: harness_demo_app_service
+            serviceInputs:
+              serviceDefinition:
+                type: Kubernetes
+                spec:
+                  artifacts:
+                    primary:
+                      primaryArtifactRef: <+input>
+                      sources:
+                        - identifier: dockerhub_image
+                          type: DockerRegistry
+                          spec:
+                            connectorRef: account.dockerhub_connector
+                            imagePath: <+pipeline.variables.DOCKER_REPO>
+                            tag: <+pipeline.variables.IMAGE_TAG>
+          environment:
+            environmentRef: dev
+            deployToAll: false
+            infrastructureDefinitions:
+              - identifier: local_k8s
+          execution:
+            steps:
+              # Standard Harness rolling deployment — applies k8s/ manifests
+              # and waits for the new ReplicaSet to become healthy.
+              - step:
+                  type: K8sRollingDeploy
+                  name: Rolling deploy
+                  identifier: rolling_deploy
+                  timeout: 10m
+                  spec:
+                    skipDryRun: false
+                    pruningEnabled: true
+            # ---- Failure handling: rollback the deployment --------------
+            rollbackSteps:
+              - step:
+                  type: K8sRollingRollback
+                  name: Rollback rolling deploy
+                  identifier: rollback_deploy
+                  timeout: 10m
+                  spec: {}
+
+        failureStrategies:
+          - onFailure:
+              errors: [AllErrors]
+              action:
+                type: StageRollback
+
+    # ======================================================================
+    # 4) Post-deployment Validation
+    # ======================================================================
+    - stage:
+        name: Post-deploy validation
+        identifier: post_deploy_validate
+        type: Custom
+        spec:
+          execution:
+            steps:
+              - step:
+                  type: ShellScript
+                  name: Curl /health endpoint
+                  identifier: curl_health
+                  timeout: 5m
+                  spec:
+                    shell: Bash
+                    onDelegate: true
+                    source:
+                      type: Inline
+                      spec:
+                        # Hit the in-cluster service via kubectl port-forward
+                        # (works the same on minikube/kind without an ingress).
+                        # Retries with backoff give the Service a moment to settle.
+                        script: |
+                          set -euo pipefail
+
+                          NS="<+pipeline.variables.K8S_NAMESPACE>"
+                          SVC="harness-demo-app"
+                          PORT=8080
+                          LOCAL_PORT=18080
+
+                          echo ">> Port-forwarding svc/${SVC} in ns/${NS} to :${LOCAL_PORT}"
+                          kubectl -n "$NS" port-forward "svc/${SVC}" ${LOCAL_PORT}:80 >/tmp/pf.log 2>&1 &
+                          PF_PID=$!
+                          trap 'kill $PF_PID 2>/dev/null || true' EXIT
+
+                          # wait for port-forward to come up
+                          for i in 1 2 3 4 5; do
+                            sleep 2
+                            if nc -z 127.0.0.1 ${LOCAL_PORT}; then break; fi
+                            echo "  port-forward not ready yet ($i/5)..."
+                          done
+
+                          # Retry the health check with simple backoff
+                          attempts=0
+                          max_attempts=10
+                          until curl -fsS "http://127.0.0.1:${LOCAL_PORT}/health" | tee /tmp/health.json; do
+                            attempts=$((attempts+1))
+                            if [ $attempts -ge $max_attempts ]; then
+                              echo "!! /health failed after ${max_attempts} attempts"
+                              cat /tmp/pf.log || true
+                              exit 1
+                            fi
+                            echo "  attempt ${attempts}/${max_attempts} failed, retrying..."
+                            sleep 3
+                          done
+
+                          # Assert the JSON contains "status":"ok"
+                          if ! grep -q '"status":[[:space:]]*"ok"' /tmp/health.json; then
+                            echo "!! /health did not return status=ok"
+                            exit 1
+                          fi
+
+                          echo ">> Post-deploy validation passed."
+
+        failureStrategies:
+          - onFailure:
+              errors: [AllErrors]
+              # If validation fails, roll the previous CD stage back.
+              action:
+                type: StageRollback
+
+  # ---- Pipeline-level retry/failure policy (applied where not overridden) -
+  # Retry transient errors twice with 10s backoff before failing the stage.
+  # Helps with flaky network calls, image pull blips, etc.
