@@ -12,7 +12,7 @@ echo ">> Applying namespace"
 kubectl apply -f k8s/namespace.yaml
 
 echo ">> Rendering deployment with image=${IMAGE}"
-sed "s|<+pipeline.variables.DOCKER_REPO>:<+pipeline.variables.IMAGE_TAG>|${IMAGE}|g" k8s/deployment.yaml | kubectl apply -f -
+sed "s|ykbundela/harness-demo-app:latest|${IMAGE}|g" k8s/deployment.yaml | kubectl apply -f -
 
 echo ">> Applying service"
 kubectl apply -f k8s/service.yaml

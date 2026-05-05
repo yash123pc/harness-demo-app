@@ -104,7 +104,9 @@ minikube image load "${LOCAL_IMAGE}"
 # -----------------------------------------------------------------------------
 log "Step 4/5  Apply K8s manifests"
 kubectl apply -f k8s/namespace.yaml
-sed "s|<+pipeline.variables.DOCKER_REPO>:<+pipeline.variables.IMAGE_TAG>|${LOCAL_IMAGE}|g" k8s/deployment.yaml | kubectl apply -f -
+# Image is hardcoded in deployment.yaml as ykbundela/harness-demo-app:latest.
+# For local bootstrap, swap it with the freshly-built local SHA tag.
+sed "s|ykbundela/harness-demo-app:latest|${LOCAL_IMAGE}|g" k8s/deployment.yaml | kubectl apply -f -
 kubectl apply -f k8s/service.yaml
 
 echo "  waiting for rollout..."
