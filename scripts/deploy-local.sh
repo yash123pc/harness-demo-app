@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Deploys the manifests in k8s/ to the active kubectl context.
-# Substitutes IMAGE_PLACEHOLDER with the image you pass in.
+# Substitutes the Harness artifact-image token with the image you pass in.
 #
 # Usage:
 #   ./scripts/deploy-local.sh docker.io/<your-user>/harness-demo-app:<tag>
@@ -12,7 +12,7 @@ echo ">> Applying namespace"
 kubectl apply -f k8s/namespace.yaml
 
 echo ">> Rendering deployment with image=${IMAGE}"
-sed "s|IMAGE_PLACEHOLDER|${IMAGE}|g" k8s/deployment.yaml | kubectl apply -f -
+sed "s|<+artifact.image>|${IMAGE}|g" k8s/deployment.yaml | kubectl apply -f -
 
 echo ">> Applying service"
 kubectl apply -f k8s/service.yaml

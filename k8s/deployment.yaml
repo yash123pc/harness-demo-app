@@ -31,9 +31,11 @@ spec:
           type: RuntimeDefault
       containers:
         - name: app
-          # Image tag is templated by Harness — value of <+artifact.tag> is substituted at deploy time.
-          # Example concrete value: docker.io/<your-dockerhub-user>/harness-demo-app:<commitSha>
-          image: IMAGE_PLACEHOLDER
+          # Image is resolved by Harness CD at deploy time using the Service's primary artifact.
+          # <+artifact.image> expands to the full registry/repo:tag string, e.g.
+          # index.docker.io/ykbundela/harness-demo-app:<commitSha>
+          # For local-only `kubectl apply` (bootstrap.sh), use sed to swap this token first.
+          image: <+artifact.image>
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
