@@ -31,11 +31,12 @@ spec:
           type: RuntimeDefault
       containers:
         - name: app
-          # Image is resolved by Harness CD at deploy time using the Service's primary artifact.
-          # <+artifact.image> expands to the full registry/repo:tag string, e.g.
-          # index.docker.io/ykbundela/harness-demo-app:<commitSha>
-          # For local-only `kubectl apply` (bootstrap.sh), use sed to swap this token first.
-          image: <+artifact.image>
+          # Image is rendered by Harness CD using pipeline variables — these are
+          # always available during manifest rendering, unlike <+artifact.image>
+          # which depends on the artifact-resolution chain working.
+          # For local-only `kubectl apply` (bootstrap.sh), sed swaps this with
+          # the actual image ref before applying.
+          image: <+pipeline.variables.DOCKER_REPO>:<+pipeline.variables.IMAGE_TAG>
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
